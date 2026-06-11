@@ -210,7 +210,7 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
   };
 }
 
-export default function (pi: ExtensionAPI) {
+export default function(pi: ExtensionAPI) {
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
     "subagent-notification",
@@ -223,7 +223,7 @@ export default function (pi: ExtensionAPI) {
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const statusText = isError ? d.status
           : d.status === "steered" ? "completed (steered)"
-          : "completed";
+            : "completed";
 
         // Line 1: icon + agent description + status
         let line = `${icon} ${theme.bold(d.description)} ${theme.fg("dim", statusText)}`;
@@ -273,26 +273,50 @@ export default function (pi: ExtensionAPI) {
   const agentActivity = new Map<string, AgentActivity>();
 
   // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
+  // Holds notifications so get_subagent_result can cancel them before they reach
+  // pi.sendMessage (fire-and-forget). During a parent turn, keep them internal
+  // until turn_end so same-turn result consumption can still cancel them.
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  const heldNudges = new Map<string, () => void>();
   const NUDGE_HOLD_MS = 200;
+  let parentTurnActive = false;
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     cancelNudge(key);
+    if (parentTurnActive) {
+      heldNudges.set(key, send);
+      return;
+    }
+
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
       try { send(); } catch { /* ignore stale completion side-effect errors */ }
     }, delay));
   }
 
+  function flushHeldNudges() {
+    const held = [...heldNudges];
+    heldNudges.clear();
+    for (const [key, send] of held) scheduleNudge(key, send);
+  }
+
   function cancelNudge(key: string) {
+    heldNudges.delete(key);
     const timer = pendingNudges.get(key);
     if (timer != null) {
       clearTimeout(timer);
       pendingNudges.delete(key);
     }
   }
+
+  pi.on("turn_start", async () => {
+    parentTurnActive = true;
+  });
+
+  pi.on("turn_end", async () => {
+    parentTurnActive = false;
+    flushHeldNudges();
+  });
 
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
@@ -506,6 +530,7 @@ export default function (pi: ExtensionAPI) {
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
+    heldNudges.clear();
     manager.dispose();
   });
 
@@ -1526,8 +1551,8 @@ Terse command-style prompts produce shallow, generic work.
 
     const noAgentsMsg = allNames.length === 0 && agents.length === 0
       ? "No agents found. Create specialized subagents that can be delegated to.\n\n" +
-        "Each subagent has its own context window, custom system prompt, and specific tools.\n\n" +
-        "Try creating: Code Reviewer, Security Auditor, Test Writer, or Documentation Writer.\n\n"
+      "Each subagent has its own context window, custom system prompt, and specific tools.\n\n" +
+      "Try creating: Code Reviewer, Security Auditor, Test Writer, or Documentation Writer.\n\n"
       : "";
 
     if (noAgentsMsg) {

@@ -11,7 +11,15 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
-function makePi() {
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function makePi(sendMessage = vi.fn(() => {
+  throw new Error("stale extension context");
+})) {
   const tools = new Map<string, any>();
   const handlers = new Map<string, any>();
   const eventHandlers = new Map<string, any>();
@@ -34,14 +42,14 @@ function makePi() {
         }),
       },
       appendEntry: vi.fn(),
-      sendMessage: vi.fn(() => {
-        throw new Error("stale extension context");
-      }),
+      sendMessage,
     } as any,
     tools,
     handlers,
   };
 }
+
+const textOf = (result: any): string => result.content[0].text;
 
 const completedRun = () => ({
   responseText: "done",
@@ -77,7 +85,7 @@ function makeHeadlessCtx() {
 }
 
 async function spawnBackground(tools: Map<string, any>) {
-  await tools.get("Agent").execute(
+  const result = await tools.get("Agent").execute(
     "tool-call-1",
     {
       prompt: "reply done",
@@ -89,6 +97,10 @@ async function spawnBackground(tools: Map<string, any>) {
     undefined,
     makeHeadlessCtx(),
   );
+
+  const id = textOf(result).match(/Agent ID: (\S+)/)?.[1];
+  expect(id, "background spawn should return an agent id").toBeTruthy();
+  return id!;
 }
 
 describe("print mode background notifications", () => {
@@ -110,6 +122,58 @@ describe("print mode background notifications", () => {
 
     expect(pi.sendMessage).toHaveBeenCalled();
 
+    await handlers.get("session_shutdown")?.({}, makeHeadlessCtx());
+  });
+
+  it("lets same-turn get_subagent_result consume a completion before it becomes a follow-up", async () => {
+    vi.useFakeTimers();
+    const child = deferred<any>();
+    vi.mocked(runAgent).mockReturnValue(child.promise);
+    const sendMessage = vi.fn();
+    const { pi, tools, handlers } = makePi(sendMessage);
+    subagentsExtension(pi);
+    await handlers.get("turn_start")?.({ type: "turn_start", turnIndex: 0 }, makeHeadlessCtx());
+
+    const id = await spawnBackground(tools);
+    child.resolve(completedRun());
+    await advanceCompletionNudgeWindow();
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    const result = await tools.get("get_subagent_result").execute(
+      "get-result-tool-call",
+      { agent_id: id, wait: true },
+      undefined,
+      undefined,
+      makeHeadlessCtx(),
+    );
+    expect(textOf(result)).toContain("done");
+
+    await handlers.get("turn_end")?.({ type: "turn_end", turnIndex: 0, message: {} }, makeHeadlessCtx());
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    await handlers.get("session_shutdown")?.({}, makeHeadlessCtx());
+  });
+
+  it("still sends an active-turn completion nudge after turn end if the result was not consumed", async () => {
+    vi.useFakeTimers();
+    const child = deferred<any>();
+    vi.mocked(runAgent).mockReturnValue(child.promise);
+    const sendMessage = vi.fn();
+    const { pi, tools, handlers } = makePi(sendMessage);
+    subagentsExtension(pi);
+    await handlers.get("turn_start")?.({ type: "turn_start", turnIndex: 0 }, makeHeadlessCtx());
+
+    await spawnBackground(tools);
+    child.resolve(completedRun());
+    await advanceCompletionNudgeWindow();
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    await handlers.get("turn_end")?.({ type: "turn_end", turnIndex: 0, message: {} }, makeHeadlessCtx());
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0][0].content).toContain("done");
     await handlers.get("session_shutdown")?.({}, makeHeadlessCtx());
   });
 });
