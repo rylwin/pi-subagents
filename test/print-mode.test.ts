@@ -43,6 +43,18 @@ function makePi() {
   };
 }
 
+const completedRun = () => ({
+  responseText: "done",
+  session: { dispose: vi.fn() } as any,
+  aborted: false,
+  steered: false,
+});
+
+async function advanceCompletionNudgeWindow() {
+  await vi.advanceTimersByTimeAsync(100); // smart-join batch debounce
+  await vi.advanceTimersByTimeAsync(200); // notification hold window
+}
+
 function makeHeadlessCtx() {
   return {
     hasUI: false,
@@ -64,6 +76,21 @@ function makeHeadlessCtx() {
   } as any;
 }
 
+async function spawnBackground(tools: Map<string, any>) {
+  await tools.get("Agent").execute(
+    "tool-call-1",
+    {
+      prompt: "reply done",
+      description: "tiny child",
+      subagent_type: "general-purpose",
+      run_in_background: true,
+    },
+    undefined,
+    undefined,
+    makeHeadlessCtx(),
+  );
+}
+
 describe("print mode background notifications", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -71,33 +98,15 @@ describe("print mode background notifications", () => {
   });
 
   it("ignores stale-context errors from delayed completion nudges", async () => {
-    vi.mocked(runAgent).mockResolvedValue({
-      responseText: "done",
-      session: { dispose: vi.fn() } as any,
-      aborted: false,
-      steered: false,
-    });
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
 
     const { pi, tools, handlers } = makePi();
     subagentsExtension(pi);
     vi.useFakeTimers();
 
-    const agentTool = tools.get("Agent");
-    await agentTool.execute(
-      "tool-call-1",
-      {
-        prompt: "reply done",
-        description: "tiny child",
-        subagent_type: "general-purpose",
-        run_in_background: true,
-      },
-      undefined,
-      undefined,
-      makeHeadlessCtx(),
-    );
+    await spawnBackground(tools);
 
-    await vi.advanceTimersByTimeAsync(100); // smart-join batch debounce
-    await vi.advanceTimersByTimeAsync(200); // notification hold window
+    await advanceCompletionNudgeWindow();
 
     expect(pi.sendMessage).toHaveBeenCalled();
 
